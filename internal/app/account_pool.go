@@ -70,17 +70,12 @@ func accountHasUsableArtifacts(cfg AppConfig, account NotionAccount) bool {
 
 func accountDispatchEligible(cfg AppConfig, account NotionAccount, now time.Time) (bool, string) {
 	account = ensureAccountPaths(cfg, account)
+	_ = now
 	if account.Disabled {
 		return false, "disabled"
 	}
 	if !accountHasUsableArtifacts(cfg, account) {
 		return false, "missing_artifacts"
-	}
-	if accountCooldownActive(account, now) {
-		return false, "cooldown"
-	}
-	if remaining, limited := accountRemainingQuota(account, now); limited && remaining <= 0 {
-		return false, "quota_exhausted"
 	}
 	return true, "ready"
 }
@@ -141,7 +136,7 @@ func markAccountDispatchFailure(account NotionAccount, now time.Time, err error,
 			account.Status = "failed"
 		}
 	}
-	account.CooldownUntil = formatRFC3339OrEmpty(now.Add(computeAccountCooldown(account, retryable)))
+	account.CooldownUntil = ""
 	return account
 }
 

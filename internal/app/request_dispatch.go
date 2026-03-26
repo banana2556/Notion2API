@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-const defaultStreamingRequestTimeoutSec = 900
+const (
+	defaultStreamingRequestTimeoutSec  = 900
+	dispatchProtocolProbeTimeoutCapSec = 20
+)
 
 func requestTimeout(cfg AppConfig) time.Duration {
 	return time.Duration(maxInt(cfg.TimeoutSec, 10)) * time.Second
@@ -19,7 +22,7 @@ func streamRequestTimeout(cfg AppConfig) time.Duration {
 }
 
 func noEligibleAccountsError() error {
-	return fmt.Errorf("no eligible accounts available; check cooldown, quota, disabled state, or login status")
+	return fmt.Errorf("no usable accounts available; check disabled state, local artifacts, or login status")
 }
 
 func mergeDispatchCandidates(preferred *NotionAccount, candidates []NotionAccount) []NotionAccount {
@@ -97,6 +100,33 @@ func shouldPersistDispatchedAccountAsActive(cfg AppConfig, request PromptRunRequ
 	return activeKey == accountKey
 }
 
+func dispatchProtocolProbeTimeout(cfg AppConfig) time.Duration {
+	seconds := maxInt(minInt(cfg.TimeoutSec, dispatchProtocolProbeTimeoutCapSec), 5)
+	return time.Duration(seconds) * time.Second
+}
+
+func (a *App) probeAccountProtocolHealth(ctx context.Context, cfg AppConfig, session SessionInfo) error {
+	if a.accountProtocolProbeOverride != nil {
+		return a.accountProtocolProbeOverride(ctx, cfg, session)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, dispatchProtocolProbeTimeout(cfg))
+	defer cancel()
+	client := newNotionAIClient(session, cfg)
+	_, err := client.listInferenceTranscripts(probeCtx)
+	return err
+}
+
+func (a *App) loadReadyDispatchSession(ctx context.Context, cfg AppConfig, account NotionAccount) (SessionInfo, error) {
+	session, err := loadSessionInfoForAccountRefresh(cfg, account)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	if err := a.probeAccountProtocolHealth(ctx, cfg, session); err != nil {
+		return SessionInfo{}, err
+	}
+	return session, nil
+}
+
 func (a *App) loadPrimarySession(ctx context.Context, cfg AppConfig, snapshot SessionInfo, refreshReason string) (SessionInfo, error) {
 	if strings.TrimSpace(snapshot.UserID) != "" && strings.TrimSpace(snapshot.SpaceID) != "" && len(snapshot.Cookies) > 0 {
 		return snapshot, nil
@@ -129,6 +159,9 @@ func (a *App) runPromptActiveFallback(r *http.Request, request PromptRunRequest,
 	if err != nil {
 		return InferenceResult{}, err
 	}
+	if err := a.probeAccountProtocolHealth(ctx, cfg, session); err != nil {
+		return InferenceResult{}, err
+	}
 
 	emittedAny := false
 	wrappedDelta := func(delta string) error {
@@ -149,6 +182,9 @@ func (a *App) runPromptActiveFallback(r *http.Request, request PromptRunRequest,
 		if refreshErr := a.State.RefreshSession(ctx, "prompt_retry_fallback"); refreshErr == nil {
 			_, refreshed, _ := a.State.Snapshot()
 			if strings.TrimSpace(refreshed.UserID) != "" && strings.TrimSpace(refreshed.SpaceID) != "" && len(refreshed.Cookies) > 0 {
+				if probeErr := a.probeAccountProtocolHealth(ctx, cfg, refreshed); probeErr != nil {
+					return InferenceResult{}, probeErr
+				}
 				return a.runPromptWithSession(ctx, cfg, refreshed, request, wrappedDelta)
 			}
 		}
@@ -166,6 +202,9 @@ func (a *App) runPromptActiveFallbackWithSink(r *http.Request, request PromptRun
 	if err != nil {
 		return InferenceResult{}, err
 	}
+	if err := a.probeAccountProtocolHealth(ctx, cfg, session); err != nil {
+		return InferenceResult{}, err
+	}
 
 	emittedAny := false
 	wrappedText := func(delta string) error {
@@ -181,11 +220,9 @@ func (a *App) runPromptActiveFallbackWithSink(r *http.Request, request PromptRun
 		return sink.EmitReasoning(delta)
 	}
 	wrappedReasoningWarmup := func() error {
-		emittedAny = true
 		return sink.EmitReasoningWarmup()
 	}
 	wrappedKeepAlive := func() error {
-		emittedAny = true
 		return sink.EmitKeepAlive()
 	}
 
@@ -202,6 +239,9 @@ func (a *App) runPromptActiveFallbackWithSink(r *http.Request, request PromptRun
 		if refreshErr := a.State.RefreshSession(ctx, "prompt_retry_fallback"); refreshErr == nil {
 			_, refreshed, _ := a.State.Snapshot()
 			if strings.TrimSpace(refreshed.UserID) != "" && strings.TrimSpace(refreshed.SpaceID) != "" && len(refreshed.Cookies) > 0 {
+				if probeErr := a.probeAccountProtocolHealth(ctx, cfg, refreshed); probeErr != nil {
+					return InferenceResult{}, probeErr
+				}
 				return a.runPromptWithSessionWithSink(ctx, cfg, refreshed, request, InferenceStreamSink{
 					Text:            wrappedText,
 					Reasoning:       wrappedReasoning,
@@ -247,7 +287,7 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 	var lastErr error
 	for _, original := range candidates {
 		account := markAccountDispatchStart(original, time.Now())
-		session, err := loadSessionInfoForAccountRefresh(cfg, account)
+		session, err := a.loadReadyDispatchSession(ctx, cfg, account)
 		if err == nil {
 			result, runErr := a.runPromptWithSession(ctx, cfg, session, request, wrappedDelta)
 			if runErr == nil {
@@ -276,7 +316,7 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 					cfg = refreshedCfg
 					refreshedAccount, _, ok := cfg.FindAccount(account.Email)
 					if ok {
-						refreshedSession, loadErr := loadSessionInfoForAccountRefresh(cfg, refreshedAccount)
+						refreshedSession, loadErr := a.loadReadyDispatchSession(ctx, cfg, refreshedAccount)
 						if loadErr == nil {
 							result, retryErr := a.runPromptWithSession(ctx, cfg, refreshedSession, request, wrappedDelta)
 							if retryErr == nil {
@@ -328,7 +368,7 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 	if lastErr != nil {
 		return InferenceResult{}, lastErr
 	}
-	return InferenceResult{}, fmt.Errorf("no eligible accounts available")
+	return InferenceResult{}, noEligibleAccountsError()
 }
 
 func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRunRequest, sink InferenceStreamSink) (InferenceResult, error) {
@@ -361,18 +401,16 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 		return sink.EmitReasoning(delta)
 	}
 	wrappedReasoningWarmup := func() error {
-		emittedAny = true
 		return sink.EmitReasoningWarmup()
 	}
 	wrappedKeepAlive := func() error {
-		emittedAny = true
 		return sink.EmitKeepAlive()
 	}
 
 	var lastErr error
 	for _, original := range candidates {
 		account := markAccountDispatchStart(original, time.Now())
-		session, err := loadSessionInfoForAccountRefresh(cfg, account)
+		session, err := a.loadReadyDispatchSession(ctx, cfg, account)
 		if err == nil {
 			result, runErr := a.runPromptWithSessionWithSink(ctx, cfg, session, request, InferenceStreamSink{
 				Text:            wrappedText,
@@ -405,7 +443,7 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 				if saveErr := a.State.SaveAndApply(refreshedCfg); saveErr == nil {
 					cfg = refreshedCfg
 					if refreshedAccount, _, ok := cfg.FindAccount(account.Email); ok {
-						refreshedSession, loadErr := loadSessionInfoForAccountRefresh(cfg, refreshedAccount)
+						refreshedSession, loadErr := a.loadReadyDispatchSession(ctx, cfg, refreshedAccount)
 						if loadErr == nil {
 							result, retryErr := a.runPromptWithSessionWithSink(ctx, cfg, refreshedSession, request, InferenceStreamSink{
 								Text:            wrappedText,
@@ -462,5 +500,5 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 	if lastErr != nil {
 		return InferenceResult{}, lastErr
 	}
-	return InferenceResult{}, fmt.Errorf("no eligible accounts available")
+	return InferenceResult{}, noEligibleAccountsError()
 }

@@ -43,6 +43,7 @@ type App struct {
 	runPromptStreamSinkOverride      func(*http.Request, PromptRunRequest, InferenceStreamSink) (InferenceResult, error)
 	runPromptWithSessionOverride     func(context.Context, AppConfig, SessionInfo, PromptRunRequest, func(string) error) (InferenceResult, error)
 	runPromptWithSessionSinkOverride func(context.Context, AppConfig, SessionInfo, PromptRunRequest, InferenceStreamSink) (InferenceResult, error)
+	accountProtocolProbeOverride     func(context.Context, AppConfig, SessionInfo) error
 }
 
 type continuationTarget struct {
