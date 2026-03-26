@@ -989,6 +989,29 @@ func (a *App) persistConversationSession(conversationID string, request PromptRu
 	}
 }
 
+func (a *App) persistConversationSummary(conversationID string, fingerprint string, summary string, coveredMessageCount int) {
+	conversationID = strings.TrimSpace(conversationID)
+	summary = strings.TrimSpace(summary)
+	if conversationID == "" || summary == "" || coveredMessageCount <= 0 {
+		return
+	}
+	a.State.mu.RLock()
+	store := a.State.Store
+	a.State.mu.RUnlock()
+	if store == nil {
+		return
+	}
+	if err := store.SaveConversationSummary(ConversationMemorySummary{
+		ConversationID:      conversationID,
+		Fingerprint:         strings.TrimSpace(fingerprint),
+		SummaryText:         summary,
+		CoveredMessageCount: coveredMessageCount,
+		UpdatedAt:           time.Now().UTC(),
+	}); err != nil {
+		log.Printf("[sqlite] save conversation summary conversation=%s failed: %v", conversationID, err)
+	}
+}
+
 func (a *App) failConversation(conversationID string, err error) {
 	if conversationID == "" || err == nil {
 		return
@@ -1063,5 +1086,6 @@ func (a *App) deleteConversation(conversationID string) error {
 			return err
 		}
 	}
+	a.State.deleteSillyTavernBinding(conversationID)
 	return nil
 }

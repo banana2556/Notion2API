@@ -172,6 +172,9 @@ type PromptRunRequest struct {
 	HiddenPrompt                      string
 	PublicModel                       string
 	NotionModel                       string
+	ClientProfile                     string
+	ClientMode                        string
+	ClientSessionKey                  string
 	PromptProfileOverride             string
 	PromptEscalationStep              int
 	UpstreamThreadID                  string
@@ -184,6 +187,7 @@ type PromptRunRequest struct {
 	RawMessageCount                   int
 	ConversationID                    string
 	SessionRepeatTurn                 bool
+	ForceSessionRepeatTurn            bool
 	attachmentThreadReady             bool
 	continuationDraft                 *continuationTurnDraft
 	continuationScaffold              *continuationTurnScaffold

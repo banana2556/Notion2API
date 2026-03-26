@@ -367,6 +367,20 @@ func (s *ServerState) invalidateConversationSession(sessionID string, status str
 	}
 }
 
+func (s *ServerState) loadConversationSummary(conversationID string) (*ConversationMemorySummary, error) {
+	s.mu.RLock()
+	store := s.Store
+	s.mu.RUnlock()
+	if store == nil || strings.TrimSpace(conversationID) == "" {
+		return nil, nil
+	}
+	summary, ok, err := store.LoadConversationSummary(conversationID)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return &summary, nil
+}
+
 func (s *ServerState) Close() error {
 	s.mu.RLock()
 	store := s.Store
@@ -836,6 +850,10 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", nilString())
 		return
 	}
+	if isLikelySillyTavernPayload(payload) {
+		a.handleSillyTavernChatCompletionsPayload(w, r, payload)
+		return
+	}
 	normalized, err := normalizeChatInput(payload)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", nilString())
@@ -854,6 +872,8 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	hiddenPrompt := strings.TrimSpace(normalized.HiddenPrompt)
 	promptText := normalized.Prompt
 	latestPrompt := resolveRequestPromptForContinuation(normalized)
+	originalFingerprint := canonicalConversationFingerprint(hiddenPrompt, normalized.Segments)
+	originalRawMessageCount := sessionRawMessageCount(normalized.Segments)
 	request := PromptRunRequest{
 		Prompt:             promptText,
 		LatestUserPrompt:   latestPrompt,
@@ -862,8 +882,8 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		NotionModel:        entry.NotionModel,
 		UseWebSearch:       requestedWebSearch(payload, cfg.Features.UseWebSearch),
 		Attachments:        normalized.Attachments,
-		SessionFingerprint: canonicalConversationFingerprint(hiddenPrompt, normalized.Segments),
-		RawMessageCount:    sessionRawMessageCount(normalized.Segments),
+		SessionFingerprint: originalFingerprint,
+		RawMessageCount:    originalRawMessageCount,
 	}
 	preferredConversationID := requestedConversationID(r, payload)
 	conversation := ConversationEntry{}
@@ -872,7 +892,7 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		request.UpstreamThreadID = strings.TrimSpace(conversation.ThreadID)
 		request.PinnedAccountEmail = firstNonEmpty(strings.TrimSpace(conversation.AccountEmail), requestedAccountEmail(r, payload))
 		request.continuationDraft = buildContinuationDraft(matched.Session)
-		if matched.Session != nil && request.RawMessageCount == matched.Session.Session.RawMessageCount {
+		if matched.Session != nil && (request.RawMessageCount == matched.Session.Session.RawMessageCount || request.ForceSessionRepeatTurn) {
 			request.SessionRepeatTurn = true
 		}
 		request.Prompt = latestPrompt
@@ -880,7 +900,13 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		request.PinnedAccountEmail = requestedAccountEmail(r, payload)
 	}
 	request.ConversationID = firstNonEmpty(strings.TrimSpace(conversation.ID), preferredConversationID)
+	compressedInput, summaryText, coveredCount := a.applyConversationCompression(request.ConversationID, normalized)
+	request.HiddenPrompt = strings.TrimSpace(compressedInput.HiddenPrompt)
+	if strings.TrimSpace(request.UpstreamThreadID) == "" {
+		request.Prompt = compressedInput.Prompt
+	}
 	conversationID := a.startConversationTurn(conversation.ID, preferredConversationID, "api", "chat_completions", resolveRequestPromptForContinuation(normalized), request)
+	a.persistConversationSummary(conversationID, originalFingerprint, summaryText, coveredCount)
 	setConversationIDHeader(w, conversationID)
 	stream, _ := payload["stream"].(bool)
 	if stream {
@@ -899,6 +925,112 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	a.markConversationEnvelope(conversationID, "", stringValue(responsePayload["id"]))
 	a.completeConversation(conversationID, result)
 	a.persistConversationSession(conversationID, request, result)
+	writeJSON(w, http.StatusOK, responsePayload)
+}
+
+func (a *App) handleSillyTavernChatCompletions(w http.ResponseWriter, r *http.Request) {
+	payload, err := decodeBody(r)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", nilString())
+		return
+	}
+	a.handleSillyTavernChatCompletionsPayload(w, r, payload)
+}
+
+func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *http.Request, payload map[string]any) {
+	ctx, err := buildSillyTavernContext(payload)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", nilString())
+		return
+	}
+	if ctx.Normalized.Prompt == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "messages must contain text or supported attachments", "invalid_request_error", nilString())
+		return
+	}
+
+	cfg, _, registry := a.State.Snapshot()
+	entry, err := registry.Resolve(requestedModel(payload, cfg.DefaultPublicModel()), cfg.DefaultPublicModel())
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "model_not_found")
+		return
+	}
+
+	originalFingerprint := canonicalConversationFingerprint(ctx.StableHidden, ctx.RequestSegments)
+	originalRawMessageCount := sessionRawMessageCount(ctx.RequestSegments)
+	request := PromptRunRequest{
+		Prompt:             ctx.Normalized.Prompt,
+		LatestUserPrompt:   ctx.LatestPrompt,
+		HiddenPrompt:       ctx.StableHidden,
+		PublicModel:        entry.ID,
+		NotionModel:        entry.NotionModel,
+		ClientProfile:      sillyTavernClientProfile,
+		ClientMode:         ctx.Mode,
+		ClientSessionKey:   ctx.ProfileKey,
+		UseWebSearch:       requestedWebSearch(payload, cfg.Features.UseWebSearch),
+		Attachments:        ctx.Normalized.Attachments,
+		SessionFingerprint: originalFingerprint,
+		RawMessageCount:    originalRawMessageCount,
+	}
+
+	preferredConversationID := requestedConversationID(r, payload)
+	conversation := ConversationEntry{}
+	if matched, ok := a.resolveSillyTavernContinuation(r, payload, ctx); ok {
+		request.SuppressUpstreamThreadPersistence = matched.SuppressPersist
+		conversation = matched.Target.Conversation
+		request.UpstreamThreadID = strings.TrimSpace(conversation.ThreadID)
+		request.PinnedAccountEmail = firstNonEmpty(strings.TrimSpace(conversation.AccountEmail), requestedAccountEmail(r, payload))
+		request.continuationDraft = buildContinuationDraft(matched.Target.Session)
+		request.ForceSessionRepeatTurn = matched.ForceRepeatTurn
+		if request.UpstreamThreadID != "" {
+			if ctx.Mode == sillyTavernModeContinue {
+				request.Prompt = ctx.Normalized.Prompt
+			} else {
+				request.Prompt = ctx.LatestPrompt
+			}
+		}
+	} else {
+		request.PinnedAccountEmail = requestedAccountEmail(r, payload)
+		if ctx.Mode == sillyTavernModeQuiet || ctx.Mode == sillyTavernModeImpersona {
+			request.SuppressUpstreamThreadPersistence = true
+		}
+	}
+
+	if request.continuationDraft != nil && (request.RawMessageCount == request.continuationDraft.RawMessageCount || request.ForceSessionRepeatTurn) {
+		request.SessionRepeatTurn = true
+	}
+
+	request.ConversationID = firstNonEmpty(strings.TrimSpace(conversation.ID), preferredConversationID)
+	compressedInput, summaryText, coveredCount := a.applyConversationCompression(request.ConversationID, ctx.Normalized)
+	request.HiddenPrompt = strings.TrimSpace(compressedInput.HiddenPrompt)
+	if strings.TrimSpace(request.UpstreamThreadID) == "" {
+		request.Prompt = compressedInput.Prompt
+	}
+
+	conversationID := a.startConversationTurn(conversation.ID, preferredConversationID, "sillytavern", "chat_completions", ctx.DisplayPrompt, request)
+	a.persistConversationSummary(conversationID, originalFingerprint, summaryText, coveredCount)
+	setConversationIDHeader(w, conversationID)
+
+	stream, _ := payload["stream"].(bool)
+	if stream {
+		a.writeChatCompletionLiveStream(w, r, request, entry.ID, includeUsageInStream(payload), conversationID)
+		return
+	}
+
+	result, err := a.runPrompt(r, request)
+	if err != nil {
+		a.failConversation(conversationID, err)
+		a.writeUpstreamError(w, err)
+		return
+	}
+	responsePayload := buildChatCompletion(result, entry.ID, cfg.DebugUpstream)
+	attachConversationResponseMetadata(responsePayload, conversationID, result.ThreadID)
+	setThreadIDHeader(w, result.ThreadID)
+	a.markConversationEnvelope(conversationID, "", stringValue(responsePayload["id"]))
+	a.completeConversation(conversationID, result)
+	a.persistConversationSession(conversationID, request, result)
+	if !request.SuppressUpstreamThreadPersistence {
+		a.persistSillyTavernBinding(conversationID, ctx.ProfileKey, ctx.Mode)
+	}
 	writeJSON(w, http.StatusOK, responsePayload)
 }
 
@@ -937,6 +1069,8 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	hiddenPrompt := strings.TrimSpace(normalized.HiddenPrompt)
 	promptText := normalized.Prompt
 	latestPrompt := resolveRequestPromptForContinuation(normalized)
+	originalFingerprint := canonicalConversationFingerprint(hiddenPrompt, normalized.Segments)
+	originalRawMessageCount := sessionRawMessageCount(normalized.Segments)
 	request := PromptRunRequest{
 		Prompt:             promptText,
 		LatestUserPrompt:   latestPrompt,
@@ -945,8 +1079,8 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 		NotionModel:        entry.NotionModel,
 		UseWebSearch:       requestedWebSearch(payload, cfg.Features.UseWebSearch),
 		Attachments:        normalized.Attachments,
-		SessionFingerprint: canonicalConversationFingerprint(hiddenPrompt, normalized.Segments),
-		RawMessageCount:    sessionRawMessageCount(normalized.Segments),
+		SessionFingerprint: originalFingerprint,
+		RawMessageCount:    originalRawMessageCount,
 	}
 	preferredConversationID := requestedConversationID(r, payload)
 	conversation := ConversationEntry{}
@@ -955,7 +1089,7 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 		request.UpstreamThreadID = strings.TrimSpace(conversation.ThreadID)
 		request.PinnedAccountEmail = firstNonEmpty(strings.TrimSpace(conversation.AccountEmail), requestedAccountEmail(r, payload))
 		request.continuationDraft = buildContinuationDraft(matched.Session)
-		if matched.Session != nil && request.RawMessageCount == matched.Session.Session.RawMessageCount {
+		if matched.Session != nil && (request.RawMessageCount == matched.Session.Session.RawMessageCount || request.ForceSessionRepeatTurn) {
 			request.SessionRepeatTurn = true
 		}
 		request.Prompt = latestPrompt
@@ -963,7 +1097,13 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 		request.PinnedAccountEmail = requestedAccountEmail(r, payload)
 	}
 	request.ConversationID = firstNonEmpty(strings.TrimSpace(conversation.ID), preferredConversationID)
+	compressedInput, summaryText, coveredCount := a.applyConversationCompression(request.ConversationID, normalized)
+	request.HiddenPrompt = strings.TrimSpace(compressedInput.HiddenPrompt)
+	if strings.TrimSpace(request.UpstreamThreadID) == "" {
+		request.Prompt = compressedInput.Prompt
+	}
 	conversationID := a.startConversationTurn(conversation.ID, preferredConversationID, "api", "responses", resolveRequestPromptForContinuation(normalized), request)
+	a.persistConversationSummary(conversationID, originalFingerprint, summaryText, coveredCount)
 	setConversationIDHeader(w, conversationID)
 	if stream {
 		a.writeResponsesLiveStream(w, r, request, entry.ID, cfg.DebugUpstream, conversationID)
@@ -1181,6 +1321,9 @@ func (a *App) writeChatCompletionLiveStream(w http.ResponseWriter, r *http.Reque
 			}
 			a.completeConversation(conversationID, partialResult)
 			a.persistConversationSession(conversationID, request, partialResult)
+			if request.ClientProfile == sillyTavernClientProfile && !request.SuppressUpstreamThreadPersistence {
+				a.persistSillyTavernBinding(conversationID, request.ClientSessionKey, request.ClientMode)
+			}
 			finalUsage := map[string]any{}
 			if includeUsage {
 				finalUsage = buildUsage(request.Prompt, partialText, emittedReasoning.String())
@@ -1199,6 +1342,9 @@ func (a *App) writeChatCompletionLiveStream(w http.ResponseWriter, r *http.Reque
 	result.Reasoning = sanitizeAssistantVisibleText(result.Reasoning)
 	a.completeConversation(conversationID, result)
 	a.persistConversationSession(conversationID, request, result)
+	if request.ClientProfile == sillyTavernClientProfile && !request.SuppressUpstreamThreadPersistence {
+		a.persistSillyTavernBinding(conversationID, request.ClientSessionKey, request.ClientMode)
+	}
 
 	assistantText := result.Text
 	reasoningText := result.Reasoning
@@ -1659,6 +1805,8 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.serveModelByID(safeWriter, path)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/v1/responses/"):
 		a.serveResponseByID(safeWriter, path)
+	case r.Method == http.MethodPost && path == "/v1/st/chat/completions":
+		a.handleSillyTavernChatCompletions(safeWriter, r)
 	case r.Method == http.MethodPost && path == "/v1/chat/completions":
 		a.handleChatCompletions(safeWriter, r)
 	case r.Method == http.MethodPost && path == "/v1/responses":

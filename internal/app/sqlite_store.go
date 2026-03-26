@@ -129,6 +129,25 @@ func (s *SQLiteStore) init() error {
 			UNIQUE(updated_config_id)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_conversation_session_steps_session_id ON conversation_session_steps(session_id, step_index ASC);`,
+		`CREATE TABLE IF NOT EXISTS conversation_summaries (
+			conversation_id TEXT PRIMARY KEY,
+			fingerprint TEXT NOT NULL DEFAULT '',
+			summary_text TEXT NOT NULL DEFAULT '',
+			covered_message_count INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_conversation_summaries_fingerprint ON conversation_summaries(fingerprint);`,
+		`CREATE TABLE IF NOT EXISTS sillytavern_bindings (
+			conversation_id TEXT PRIMARY KEY,
+			profile_key TEXT NOT NULL DEFAULT '',
+			thread_id TEXT NOT NULL DEFAULT '',
+			account_email TEXT NOT NULL DEFAULT '',
+			mode TEXT NOT NULL DEFAULT '',
+			transcript_json TEXT NOT NULL DEFAULT '[]',
+			raw_message_count INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_sillytavern_bindings_profile_key ON sillytavern_bindings(profile_key, updated_at DESC);`,
 	}
 	for _, stmt := range schema {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -262,6 +281,49 @@ func (s *SQLiteStore) DeleteConversation(id string) error {
 	}
 	_, err := s.db.Exec(`DELETE FROM conversations WHERE id = ?`, strings.TrimSpace(id))
 	return err
+}
+
+func (s *SQLiteStore) SaveConversationSummary(summary ConversationMemorySummary) error {
+	if s == nil || s.db == nil || strings.TrimSpace(summary.ConversationID) == "" {
+		return nil
+	}
+	if summary.UpdatedAt.IsZero() {
+		summary.UpdatedAt = time.Now().UTC()
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO conversation_summaries(conversation_id, fingerprint, summary_text, covered_message_count, updated_at)
+		 VALUES(?, ?, ?, ?, ?)
+		 ON CONFLICT(conversation_id) DO UPDATE SET
+		   fingerprint=excluded.fingerprint,
+		   summary_text=excluded.summary_text,
+		   covered_message_count=excluded.covered_message_count,
+		   updated_at=excluded.updated_at`,
+		strings.TrimSpace(summary.ConversationID),
+		strings.TrimSpace(summary.Fingerprint),
+		strings.TrimSpace(summary.SummaryText),
+		maxInt(summary.CoveredMessageCount, 0),
+		summary.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+func (s *SQLiteStore) LoadConversationSummary(conversationID string) (ConversationMemorySummary, bool, error) {
+	if s == nil || s.db == nil || strings.TrimSpace(conversationID) == "" {
+		return ConversationMemorySummary{}, false, nil
+	}
+	row := s.db.QueryRow(`SELECT conversation_id, fingerprint, summary_text, covered_message_count, updated_at FROM conversation_summaries WHERE conversation_id = ?`, strings.TrimSpace(conversationID))
+	var summary ConversationMemorySummary
+	var updatedAt string
+	if err := row.Scan(&summary.ConversationID, &summary.Fingerprint, &summary.SummaryText, &summary.CoveredMessageCount, &updatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return ConversationMemorySummary{}, false, nil
+		}
+		return ConversationMemorySummary{}, false, err
+	}
+	if ts, err := time.Parse(time.RFC3339Nano, updatedAt); err == nil {
+		summary.UpdatedAt = ts
+	}
+	return summary, true, nil
 }
 
 func (s *SQLiteStore) DeleteResponsesByConversationOrThread(conversationID string, threadID string) error {
@@ -630,6 +692,99 @@ func (s *SQLiteStore) DeleteConversationSessionByConversationOrThread(conversati
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *SQLiteStore) SaveSillyTavernBinding(binding SillyTavernBinding) error {
+	if s == nil || s.db == nil || strings.TrimSpace(binding.ConversationID) == "" {
+		return nil
+	}
+	transcriptJSON, err := json.Marshal(binding.Transcript)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO sillytavern_bindings(
+			conversation_id, profile_key, thread_id, account_email, mode, transcript_json, raw_message_count, updated_at
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(conversation_id) DO UPDATE SET
+			profile_key=excluded.profile_key,
+			thread_id=excluded.thread_id,
+			account_email=excluded.account_email,
+			mode=excluded.mode,
+			transcript_json=excluded.transcript_json,
+			raw_message_count=excluded.raw_message_count,
+			updated_at=excluded.updated_at`,
+		strings.TrimSpace(binding.ConversationID),
+		strings.TrimSpace(binding.ProfileKey),
+		strings.TrimSpace(binding.ThreadID),
+		strings.TrimSpace(binding.AccountEmail),
+		strings.TrimSpace(binding.Mode),
+		string(transcriptJSON),
+		binding.RawMessageCount,
+		formatSQLiteTime(binding.UpdatedAt),
+	)
+	return err
+}
+
+func (s *SQLiteStore) LoadRecentSillyTavernBindings(profileKey string, limit int) ([]SillyTavernBinding, error) {
+	if s == nil || s.db == nil || strings.TrimSpace(profileKey) == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 12
+	}
+	rows, err := s.db.Query(
+		`SELECT conversation_id, profile_key, thread_id, account_email, mode, transcript_json, raw_message_count, updated_at
+		 FROM sillytavern_bindings
+		 WHERE profile_key = ?
+		 ORDER BY updated_at DESC
+		 LIMIT ?`,
+		strings.TrimSpace(profileKey),
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []SillyTavernBinding
+	for rows.Next() {
+		var (
+			binding        SillyTavernBinding
+			transcriptJSON string
+			updatedAt      string
+		)
+		if err := rows.Scan(
+			&binding.ConversationID,
+			&binding.ProfileKey,
+			&binding.ThreadID,
+			&binding.AccountEmail,
+			&binding.Mode,
+			&transcriptJSON,
+			&binding.RawMessageCount,
+			&updatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(transcriptJSON) != "" {
+			_ = json.Unmarshal([]byte(transcriptJSON), &binding.Transcript)
+		}
+		if clean := strings.TrimSpace(updatedAt); clean != "" {
+			if parsed, parseErr := time.Parse(time.RFC3339Nano, clean); parseErr == nil {
+				binding.UpdatedAt = parsed
+			}
+		}
+		out = append(out, binding)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStore) DeleteSillyTavernBinding(conversationID string) error {
+	if s == nil || s.db == nil || strings.TrimSpace(conversationID) == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`DELETE FROM sillytavern_bindings WHERE conversation_id = ?`, strings.TrimSpace(conversationID))
+	return err
 }
 
 func formatSQLiteTime(value time.Time) string {
