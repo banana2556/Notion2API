@@ -22,7 +22,7 @@ COPY static ./static
 COPY --from=frontend-builder /frontend/out /src/static/admin
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    test -f ./cmd/notion2api/main.go \
+    test -f ./main.go \
     && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -v -trimpath -ldflags="-s -w" -o /out/notion2api ./cmd/notion2api
 
 FROM debian:bookworm-slim
