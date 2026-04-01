@@ -183,6 +183,7 @@ type PromptRunRequest struct {
 	PinnedAccountEmail                string
 	AllowPinnedAccountFallback        bool
 	StreamReasoningWarmup             bool
+	SuppressReasoningOutput           bool
 	SuppressUpstreamThreadPersistence bool
 	SessionFingerprint                string
 	RawMessageCount                   int
